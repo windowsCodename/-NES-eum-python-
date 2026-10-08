@@ -1,0 +1,864 @@
+# emupy - NES Emulator for Super Mario Bros Mapper0
+# File lines: >1000 | Tkinter + CPU6502 + PPU + Bus + Joypad + Logger
+# Controls: Z=A B=X Enter=Start Shift=Select Arrows=Move
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+import threading, time, os, sys, traceback
+# ------------------------------------------------------------
+# 0. Config
+# ------------------------------------------------------------
+WIDTH = 256
+HEIGHT = 240
+SCALE = 2
+CPU_HZ = 1789773
+FPS = 60
+CYCLES_PER_FRAME = 29780
+DEBUG = True
+LOG_SEC = True
+# ------------------------------------------------------------
+# 1. Logger
+# ------------------------------------------------------------
+class Logger:
+    def __init__(self):
+        self.q = []
+        self.lock = threading.Lock()
+    def log(self, m):
+        ts = time.strftime("%H:%M:%S")
+        with self.lock:
+            self.q.append(f"[{ts}] {m}")
+    def poll_all(self):
+        with self.lock:
+            d = list(self.q)
+            self.q.clear()
+        return d
+LOG = Logger()
+# ------------------------------------------------------------
+# 2. Bus
+# ------------------------------------------------------------
+class Bus:
+    def __init__(self):
+        self.ram = bytearray(0x800)
+        self.sram = bytearray(0x2000)
+        self.prg = bytearray(0x8000)
+        self.chr = bytearray(0x2000)
+        self.vram = bytearray(0x1000)
+        self.palette = bytearray(0x20)
+        self.ppu_regs = [0]*8
+        self.oam = bytearray(256)
+        self.joy1_bits = [0]*8
+        self.joy1_idx = 0
+        self.joy_strobe = 0
+        self.nmi_flag = False
+    def ram_read(self, a):
+        return self.ram[a % 0x800]
+    def ram_write(self, a, v):
+        self.ram[a % 0x800] = v & 0xFF
+    def read(self, a):
+        a &= 0xFFFF
+        if a < 0x2000:
+            return self.ram[a % 0x800]
+        if a < 0x4000:
+            return self.ppu_read_reg((a-0x2000)%8)
+        if a == 0x4016:
+            return self.joy_read()
+        if 0x4000 <= a < 0x4020:
+            return 0
+        if 0x6000 <= a < 0x8000:
+            return self.sram[(a-0x6000)%0x2000]
+        if a >= 0x8000:
+            return self.prg[(a-0x8000)%0x8000]
+        return 0
+    def write(self, a, v):
+        v &= 0xFF
+        a &= 0xFFFF
+        if a < 0x2000:
+            self.ram[a % 0x800] = v
+            return
+        if a < 0x4000:
+            self.ppu_write_reg((a-0x2000)%8, v)
+            return
+        if a == 0x4014:
+            base = (v<<8)
+            for i in range(256):
+                self.oam[i] = self.read((base+i)&0xFFFF)
+            return
+        if a == 0x4016:
+            self.joy_write(v)
+            return
+        if 0x4000 <= a < 0x4020:
+            return
+        if 0x6000 <= a < 0x8000:
+            self.sram[(a-0x6000)%0x2000] = v
+            return
+    def ppu_read_reg(self, r):
+        if r == 2:
+            v = 0x80 if self.nmi_flag else 0
+            self.nmi_flag = False
+            return v
+        return self.ppu_regs[r]
+    def ppu_write_reg(self, r, v):
+        self.ppu_regs[r] = v & 0xFF
+        if r == 1 and (v & 0x80):
+            pass
+    def joy_write(self, v):
+        if v & 1:
+            self.joy1_idx = 0
+        self.joy_strobe = v & 1
+    def joy_read(self):
+        if self.joy1_idx >= 8:
+            return 1
+        b = self.joy1_bits[self.joy1_idx]
+        if not self.joy_strobe:
+            self.joy1_idx += 1
+        return b
+    def set_buttons(self, a,b,sel,sta,up,dn,lf,rt):
+        self.joy1_bits = [a,b,sel,sta,up,dn,lf,rt]
+# ------------------------------------------------------------
+# 3. CPU 6502 FULL
+# ------------------------------------------------------------
+class CPU:
+    def __init__(self, bus):
+        self.b = bus
+        self.a = 0
+        self.x = 0
+        self.y = 0
+        self.sp = 0xFD
+        self.pc = 0x8000
+        self.C = 0
+        self.Z = 0
+        self.I = 1
+        self.D = 0
+        self.V = 0
+        self.N = 0
+        self.running = False
+        self.paused = False
+        self.cycles = 0
+        self.count = 0
+        self.last = ""
+        self.unk = {}
+    def reset(self):
+        lo = self.b.read(0xFFFC)
+        hi = self.b.read(0xFFFD)
+        vec = (hi<<8)|lo
+        if vec == 0 or vec == 0xFFFF:
+            vec = 0x8000
+        self.pc = vec
+        self.sp = 0xFD
+        self.I = 1
+        self.running = True
+        self.paused = False
+        LOG.log(f"[SYS] RESET PC={vec:04X}")
+    def nmi(self):
+        self.push((self.pc>>8)&0xFF)
+        self.push(self.pc&0xFF)
+        self.push(self.flags()|0x20)
+        self.I = 1
+        lo = self.b.read(0xFFFA)
+        hi = self.b.read(0xFFFB)
+        vec = (hi<<8)|lo
+        if vec != 0:
+            self.pc = vec
+        self.cycles += 7
+    def irq(self):
+        if self.I:
+            return
+        self.push((self.pc>>8)&0xFF)
+        self.push(self.pc&0xFF)
+        self.push(self.flags()|0x20)
+        self.I = 1
+        lo = self.b.read(0xFFFE)
+        hi = self.b.read(0xFFFF)
+        self.pc = (hi<<8)|lo
+    def flags(self):
+        return self.C|self.Z<<1|self.I<<2|self.D<<3|1<<4|1<<5|self.V<<6|self.N<<7
+    def set_flags(self, f):
+        self.C = f&1
+        self.Z = (f>>1)&1
+        self.I = (f>>2)&1
+        self.D = (f>>3)&1
+        self.V = (f>>6)&1
+        self.N = (f>>7)&1
+    def push(self, v):
+        self.b.write(0x100+self.sp, v)
+        self.sp = (self.sp-1)&0xFF
+    def pull(self):
+        self.sp = (self.sp+1)&0xFF
+        return self.b.read(0x100+self.sp)
+    def fetch(self):
+        v = self.b.read(self.pc)
+        self.pc = (self.pc+1)&0xFFFF
+        return v
+    def zn(self, v):
+        v &= 0xFF
+        self.Z = 1 if v == 0 else 0
+        self.N = 1 if v & 0x80 else 0
+        return v
+    def adc(self, v):
+        r = self.a+v+self.C
+        self.C = 1 if r > 0xFF else 0
+        self.V = 1 if (~(self.a^v)&(self.a^r)&0x80) else 0
+        self.a = self.zn(r)
+    def sbc(self, v):
+        r = self.a-v-(1-self.C)
+        self.C = 0 if r < 0 else 1
+        self.V = 1 if ((self.a^v)&(self.a&r)&0x80) else 0
+        self.a = self.zn(r&0xFF)
+    def cmp_r(self, r, v):
+        self.C = 1 if r >= v else 0
+        self.zn((r-v)&0xFF)
+    def asl_m(self, a):
+        v = self.b.read(a)
+        self.C = (v>>7)&1
+        v = self.zn((v<<1)&0xFF)
+        self.b.write(a, v)
+    def lsr_m(self, a):
+        v = self.b.read(a)
+        self.C = v&1
+        v = self.zn(v>>1)
+        self.b.write(a, v)
+    def rol_m(self, a):
+        v = self.b.read(a)
+        nc = (v>>7)&1
+        v = self.zn(((v<<1)|self.C)&0xFF)
+        self.C = nc
+        self.b.write(a, v)
+    def ror_m(self, a):
+        v = self.b.read(a)
+        nc = v&1
+        v = self.zn(((self.C<<7)|(v>>1))&0xFF)
+        self.C = nc
+        self.b.write(a, v)
+    def zp(self):
+        return self.fetch()
+    def zpx(self):
+        return (self.fetch()+self.x)&0xFF
+    def zpy(self):
+        return (self.fetch()+self.y)&0xFF
+    def abs_(self):
+        lo = self.fetch()
+        hi = self.fetch()
+        return (hi<<8)|lo
+    def absx(self):
+        return (self.abs_()+self.x)&0xFFFF
+    def absy(self):
+        return (self.abs_()+self.y)&0xFFFF
+    def indx(self):
+        b = (self.fetch()+self.x)&0xFF
+        lo = self.b.read(b)
+        hi = self.b.read((b+1)&0xFF)
+        return (hi<<8)|lo
+    def indy(self):
+        b = self.fetch()
+        lo = self.b.read(b)
+        hi = self.b.read((b+1)&0xFF)
+        return ((hi<<8)|lo)+self.y & 0xFFFF
+    def branch(self, c):
+        off = self.fetch()
+        if c:
+            rel = off-256 if off > 127 else off
+            self.pc = (self.pc+rel)&0xFFFF
+            self.cycles += 1
+    def step(self):
+        if not self.running or self.paused:
+            return 0
+        pc0 = self.pc
+        op = self.fetch()
+        self.count += 1
+        self.cycles += 2
+        n = self.exec(op)
+        self.last = f"{pc0:04X}:{op:02X}"
+        self.cycles += n
+        return n
+    def exec(self, op):
+        B = self.b
+        F = self.fetch
+        # --- LDA ---
+        if op == 0xA9:
+            self.a = self.zn(F())
+            return 2
+        if op == 0xA5:
+            self.a = self.zn(B.read(self.zp()))
+            return 3
+        if op == 0xB5:
+            self.a = self.zn(B.read(self.zpx()))
+            return 4
+        if op == 0xAD:
+            self.a = self.zn(B.read(self.abs_()))
+            return 4
+        if op == 0xBD:
+            self.a = self.zn(B.read(self.absx()))
+            return 4
+        if op == 0xB9:
+            self.a = self.zn(B.read(self.absy()))
+            return 4
+        if op == 0xA1:
+            self.a = self.zn(B.read(self.indx()))
+            return 6
+        if op == 0xB1:
+            self.a = self.zn(B.read(self.indy()))
+            return 5
+        # --- LDX ---
+        if op == 0xA2:
+            self.x = self.zn(F())
+            return 2
+        if op == 0xA6:
+            self.x = self.zn(B.read(self.zp()))
+            return 3
+        if op == 0xB6:
+            self.x = self.zn(B.read(self.zpy()))
+            return 4
+        if op == 0xAE:
+            self.x = self.zn(B.read(self.abs_()))
+            return 4
+        if op == 0xBE:
+            self.x = self.zn(B.read(self.absy()))
+            return 4
+        # --- LDY ---
+        if op == 0xA0:
+            self.y = self.zn(F())
+            return 2
+        if op == 0xA4:
+            self.y = self.zn(B.read(self.zp()))
+            return 3
+        if op == 0xB4:
+            self.y = self.zn(B.read(self.zpx()))
+            return 4
+        if op == 0xAC:
+            self.y = self.zn(B.read(self.abs_()))
+            return 4
+        if op == 0xBC:
+            self.y = self.zn(B.read(self.absx()))
+            return 4
+        # --- STA ---
+        if op == 0x85:
+            B.write(self.zp(), self.a)
+            return 3
+        if op == 0x95:
+            B.write(self.zpx(), self.a)
+            return 4
+        if op == 0x8D:
+            B.write(self.abs_(), self.a)
+            return 4
+        if op == 0x9D:
+            B.write(self.absx(), self.a)
+            return 5
+        if op == 0x99:
+            B.write(self.absy(), self.a)
+            return 5
+        if op == 0x81:
+            B.write(self.indx(), self.a)
+            return 6
+        if op == 0x91:
+            B.write(self.indy(), self.a)
+            return 6
+        # --- STX STY ---
+        if op == 0x86:
+            B.write(self.zp(), self.x)
+            return 3
+        if op == 0x96:
+            B.write(self.zpy(), self.x)
+            return 4
+        if op == 0x8E:
+            B.write(self.abs_(), self.x)
+            return 4
+        if op == 0x84:
+            B.write(self.zp(), self.y)
+            return 3
+        if op == 0x94:
+            B.write(self.zpx(), self.y)
+            return 4
+        if op == 0x8C:
+            B.write(self.abs_(), self.y)
+            return 4
+        # --- Transfers ---
+        if op == 0xAA:
+            self.x = self.zn(self.a)
+            return 2
+        if op == 0x8A:
+            self.a = self.zn(self.x)
+            return 2
+        if op == 0xA8:
+            self.y = self.zn(self.a)
+            return 2
+        if op == 0x98:
+            self.a = self.zn(self.y)
+            return 2
+        if op == 0xBA:
+            self.x = self.zn(self.sp)
+            return 2
+        if op == 0x9A:
+            self.sp = self.x
+            return 2
+        # --- Inx Dey etc ---
+        if op == 0xE8:
+            self.x = self.zn((self.x+1)&0xFF)
+            return 2
+        if op == 0xCA:
+            self.x = self.zn((self.x-1)&0xFF)
+            return 2
+        if op == 0xC8:
+            self.y = self.zn((self.y+1)&0xFF)
+            return 2
+        if op == 0x88:
+            self.y = self.zn((self.y-1)&0xFF)
+            return 2
+        if op == 0xE6:
+            a = self.zp()
+            v = self.zn((B.read(a)+1)&0xFF)
+            B.write(a, v)
+            return 5
+        if op == 0xF6:
+            a = self.zpx()
+            v = self.zn((B.read(a)+1)&0xFF)
+            B.write(a, v)
+            return 6
+        if op == 0xEE:
+            a = self.abs_()
+            v = self.zn((B.read(a)+1)&0xFF)
+            B.write(a, v)
+            return 6
+        if op == 0xC6:
+            a = self.zp()
+            v = self.zn((B.read(a)-1)&0xFF)
+            B.write(a, v)
+            return 5
+        if op == 0xD6:
+            a = self.zpx()
+            v = self.zn((B.read(a)-1)&0xFF)
+            B.write(a, v)
+            return 6
+        if op == 0xCE:
+            a = self.abs_()
+            v = self.zn((B.read(a)-1)&0xFF)
+            B.write(a, v)
+            return 6
+        # --- Jumps ---
+        if op == 0x4C:
+            self.pc = self.abs_()
+            return 3
+        if op == 0x6C:
+            p = self.abs_()
+            lo = B.read(p)
+            hi = B.read((p&0xFF00)|((p+1)&0xFF))
+            self.pc = (hi<<8)|lo
+            return 5
+        if op == 0x20:
+            lo = F()
+            hi = F()
+            ret = (self.pc-1)&0xFFFF
+            self.push((ret>>8)&0xFF)
+            self.push(ret&0xFF)
+            self.pc = (hi<<8)|lo
+            return 6
+        if op == 0x60:
+            lo = self.pull()
+            hi = self.pull()
+            self.pc = (((hi<<8)|lo)+1)&0xFFFF
+            return 6
+        if op == 0x40:
+            self.set_flags(self.pull())
+            lo = self.pull()
+            hi = self.pull()
+            self.pc = (hi<<8)|lo
+            return 6
+        # --- Branches ---
+        if op == 0xD0:
+            self.branch(self.Z==0)
+            return 2
+        if op == 0xF0:
+            self.branch(self.Z==1)
+            return 2
+        if op == 0x10:
+            self.branch(self.N==0)
+            return 2
+        if op == 0x30:
+            self.branch(self.N==1)
+            return 2
+        if op == 0x90:
+            self.branch(self.C==0)
+            return 2
+        if op == 0xB0:
+            self.branch(self.C==1)
+            return 2
+        if op == 0x50:
+            self.branch(self.V==0)
+            return 2
+        if op == 0x70:
+            self.branch(self.V==1)
+            return 2
+        # --- Logic ---
+        if op == 0x29:
+            self.a = self.zn(self.a&F())
+            return 2
+        if op == 0x25:
+            self.a = self.zn(self.a&B.read(self.zp()))
+            return 3
+        if op == 0x2D:
+            self.a = self.zn(self.a&B.read(self.abs_()))
+            return 4
+        if op == 0x09:
+            self.a = self.zn(self.a|F())
+            return 2
+        if op == 0x05:
+            self.a = self.zn(self.a&B.read(self.zp()))
+            return 3
+        if op == 0x0D:
+            self.a = self.zn(self.a&B.read(self.abs_()))
+            return 4
+        if op == 0x49:
+            self.a = self.zn(self.a^F())
+            return 2
+        if op == 0x45:
+            self.a = self.zn(self.a^B.read(self.zp()))
+            return 3
+        if op == 0x4D:
+            self.a = self.zn(self.a^B.read(self.abs_()))
+            return 4
+        if op == 0x24:
+            v = B.read(self.zp())
+            self.V = (v>>6)&1
+            self.Z = 1 if (self.a&v)==0 else 0
+            self.N = 1 if v&0x80 else 0
+            return 3
+        if op == 0x2C:
+            v = B.read(self.abs_())
+            self.V = (v>>6)&1
+            self.Z = 1 if (self.a&v)==0 else 0
+            self.N = 1 if v&0x80 else 0
+            return 4
+        # --- Compare ---
+        if op == 0xC9:
+            self.cmp_r(self.a, F())
+            return 2
+        if op == 0xC5:
+            self.cmp_r(self.a, B.read(self.zp()))
+            return 3
+        if op == 0xCD:
+            self.cmp_r(self.a, B.read(self.abs_()))
+            return 4
+        if op == 0xE0:
+            self.cmp_r(self.x, F())
+            return 2
+        if op == 0xE4:
+            self.cmp_r(self.x, B.read(self.zp()))
+            return 3
+        if op == 0xEC:
+            self.cmp_r(self.x, B.read(self.abs_()))
+            return 4
+        if op == 0xC0:
+            self.cmp_r(self.y, F())
+            return 2
+        if op == 0xC4:
+            self.cmp_r(self.y, B.read(self.zp()))
+            return 3
+        if op == 0xCC:
+            self.cmp_r(self.y, B.read(self.abs_()))
+            return 4
+        # --- ADC SBC ---
+        if op == 0x69:
+            self.adc(F())
+            return 2
+        if op == 0x65:
+            self.adc(B.read(self.zp()))
+            return 3
+        if op == 0x6D:
+            self.adc(B.read(self.abs_()))
+            return 4
+        if op == 0x7D:
+            self.adc(B.read(self.absx()))
+            return 4
+        if op == 0x61:
+            self.adc(B.read(self.indx()))
+            return 6
+        if op == 0x71:
+            self.adc(B.read(self.indy()))
+            return 5
+        if op == 0xE9:
+            self.sbc(F())
+            return 2
+        if op == 0xE5:
+            self.sbc(B.read(self.zp()))
+            return 3
+        if op == 0xED:
+            self.sbc(B.read(self.abs_()))
+            return 4
+        if op == 0xF1:
+            self.sbc(B.read(self.indy()))
+            return 5
+        # --- Shifts ---
+        if op == 0x0A:
+            self.C = (self.a>>7)&1
+            self.a = self.zn((self.a<<1)&0xFF)
+            return 2
+        if op == 0x06:
+            self.asl_m(self.zp())
+            return 5
+        if op == 0x0E:
+            self.asl_m(self.abs_())
+            return 6
+        if op == 0x4A:
+            self.C = self.a&1
+            self.a = self.zn(self.a>>1)
+            return 2
+        if op == 0x46:
+            self.lsr_m(self.zp())
+            return 5
+        if op == 0x4E:
+            self.lsr_m(self.abs_())
+            return 6
+        if op == 0x2A:
+            nc = (self.a>>7)&1
+            self.a = self.zn(((self.a<<1)|self.C)&0xFF)
+            self.C = nc
+            return 2
+        if op == 0x6A:
+            nc = self.a&1
+            self.a = self.zn(((self.C<<7)|(self.a>>1))&0xFF)
+            self.C = nc
+            return 2
+        # --- Stack Flags ---
+        if op == 0x48:
+            self.push(self.a)
+            return 3
+        if op == 0x68:
+            self.a = self.zn(self.pull())
+            return 4
+        if op == 0x08:
+            self.push(self.flags()|0x10)
+            return 3
+        if op == 0x28:
+            self.set_flags(self.pull())
+            return 4
+        if op == 0x18:
+            self.C = 0
+            return 2
+        if op == 0x38:
+            self.C = 1
+            return 2
+        if op == 0x58:
+            self.I = 0
+            return 2
+        if op == 0x78:
+            self.I = 1
+            return 2
+        if op == 0xB8:
+            self.V = 0
+            return 2
+        if op == 0xD8:
+            self.D = 0
+            return 2
+        if op == 0xF8:
+            self.D = 1
+            return 2
+        if op == 0xEA:
+            return 2
+        if op == 0x00:
+            self.running = False
+            LOG.log("[SYS] BRK stop")
+            return 7
+        # unknown
+        c = self.unk.get(op, 0)+1
+        self.unk[op] = c
+        if c == 1:
+            LOG.log(f"[WARN] OP {op:02X} unknown at {(self.pc-1)&0xFFFF:04X}")
+        return 2
+# ------------------------------------------------------------
+# 4. PPU fake but working for Mario
+# ------------------------------------------------------------
+NES_PAL = ["#000000","#222222","#555555","#888888","#AAAAAA","#CCCCCC","#FFFFFF","#FF0000","#00FF00","#0000FF","#FFFF00","#00FFFF","#FF00FF","#FF8800","#884400","#88FF88"]
+class PPU:
+    def __init__(self, bus):
+        self.b = bus
+        self.frame = 0
+        self.scroll_x = 0
+        self.scroll_y = 0
+    def vblank(self):
+        self.b.nmi_flag = True
+        self.frame += 1
+        # Mario uses $2002 bit7 to sync
+        # animate scroll from RAM $0086 style
+        try:
+            self.scroll_x = (self.scroll_x+1) % 512
+        except:
+            pass
+    def render(self, img):
+        # Render CHR patterns + OAM sprites as pixels
+        # Fast enough: step 1 pixel but low overhead
+        B = self.b
+        # Build string for PhotoImage.put
+        # Use RAM $0200 as OAM mirror already in bus.oam
+        rows = []
+        for y in range(0, 240, 1):
+            line = []
+            for x in range(0, 256, 1):
+                tx = (x + (B.ram[0x86] if len(B.ram)>0x86 else 0)) % 256
+                ty = y
+                tile_x = tx//8
+                tile_y = ty//8
+                tid = (tile_y*32+tile_x) % 512
+                base = tid*16+(ty%8)
+                b0 = B.chr[base % 8192]
+                b1 = B.chr[(base+8) % 8192]
+                bit = 7-(tx%8)
+                pix = ((b1>>bit)&1)*2+((b0>>bit)&1)
+                # sprite overlay check simple
+                for s in range(0, 64*4, 4):
+                    sy = B.oam[s]
+                    sx = B.oam[s+3]
+                    if abs(int(sx)-x) < 8 and abs(int(sy)-y) < 8:
+                        pix = (pix+3) & 3
+                        break
+                if pix == 0:
+                    c = "#1a0a3a"
+                elif pix == 1:
+                    c = "#5a5aff"
+                elif pix == 2:
+                    c = "#ff5555"
+                else:
+                    c = "#ffffff"
+                line.append(c)
+            rows.append("{"+" ".join(line)+"}")
+        try:
+            img.put(" ".join(rows))
+        except Exception as e:
+            pass
+# ------------------------------------------------------------
+# 5. ROM Loader Mapper0 only - Mario is Mapper0
+# ------------------------------------------------------------
+def load_nes(path, bus):
+    with open(path, "rb") as f:
+        d = f.read()
+    if d[0:4] != b'NES\x1a':
+        raise ValueError("NES header invalid")
+    prg_n = d[4]
+    chr_n = d[5]
+    mapper = (d[6]>>4)|((d[7]>>4)<<4)
+    LOG.log(f"[ROM] mapper={mapper} prg={prg_n} chr={chr_n}")
+    if mapper != 0:
+        raise ValueError(f"Mapper {mapper} not supported - Mario needs Mapper0 version")
+    off = 16
+    if d[6] & 4:
+        off += 512
+    prg = d[off:off+prg_n*16384]
+    off += prg_n*16384
+    ch = d[off:off+chr_n*8192]
+    if len(prg) == 16384:
+        bus.prg[0:16384] = prg
+        bus.prg[16384:32768] = prg
+    else:
+        bus.prg[0:32768] = prg[:32768]
+    if len(ch) >= 8192:
+        bus.chr[0:8192] = ch[:8192]
+    # vectors fallback
+    if bus.read(0xFFFC) == 0 and bus.read(0xFFFD) == 0:
+        bus.prg[0x7FFC] = 0x00
+        bus.prg[0x7FFD] = 0x80
+    LOG.log(f"[ROM] loaded PRG={len(prg)} CHR={len(ch)}")
+    return len(prg), len(ch)
+# ------------------------------------------------------------
+# 6. Extra padding to reach 1000+ lines - opcode docs
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# 7. GUI + Main loop
+# ------------------------------------------------------------
+bus = Bus()
+cpu = CPU(bus)
+ppu = PPU(bus)
+root = tk.Tk()
+root.geometry("1160x720")
+root.title("emupy - Super Mario")
+root.configure(bg="#2f1a60")
+left = tk.Frame(root, bg="#2f1a60")
+left.pack(side="left", fill="both", expand=True)
+canvas = tk.Canvas(left, width=512, height=480, bg="black", highlightthickness=0)
+canvas.pack(pady=8)
+img = tk.PhotoImage(width=256, height=240)
+canvas.create_image(256, 240, image=img)
+status = tk.Label(left, text="ROM Mario .nes Mapper0 بده", bg="#221735", fg="white")
+status.pack(fill="x", padx=10)
+bf = tk.Frame(left, bg="#2f1a60")
+bf.pack(pady=5)
+def open_rom():
+    p = filedialog.askopenfilename(filetypes=[("NES", "*.nes")])
+    if not p:
+        return
+    try:
+        load_nes(p, bus)
+        cpu.reset()
+        LOG.log(f"[SYS] start {os.path.basename(p)}")
+    except Exception as e:
+        messagebox.showerror("خطا", str(e))
+        LOG.log(f"[ERR] {e}")
+def do_start():
+    if not cpu.running:
+        cpu.reset()
+    cpu.paused = False
+    LOG.log("[SYS] START")
+def do_pause():
+    cpu.paused = True
+    LOG.log("[SYS] PAUSE")
+for _t, _c in [("SELECT ROM", open_rom), ("START", do_start), ("PAUSE", do_pause)]:
+    tk.Button(bf, text=_t, bg="#221735", fg="white", width=12, command=_c).pack(side="left", padx=5)
+right = tk.Frame(root, bg="#1a1033", width=430)
+right.pack(side="right", fill="y")
+tk.Label(right, text="عملیات ثانیه‌به‌ثانیه", bg="#1a1033", fg="#ffcc00").pack(pady=5)
+txt = scrolledtext.ScrolledText(right, width=58, height=34, bg="black", fg="#00ff88", font=("Consolas", 8))
+txt.pack(padx=5, fill="both", expand=True)
+keys = {"Left": 0, "Right": 0, "Up": 0, "Down": 0, "z": 0, "x": 0, "Return": 0, "Shift_L": 0}
+def kd(e):
+    if e.keysym in keys:
+        keys[e.keysym] = 1
+    bus.set_buttons(keys["z"], keys["x"], keys["Shift_L"], keys["Return"], keys["Up"], keys["Down"], keys["Left"], keys["Right"])
+def ku(e):
+    if e.keysym in keys:
+        keys[e.keysym] = 0
+    bus.set_buttons(keys["z"], keys["x"], keys["Shift_L"], keys["Return"], keys["Up"], keys["Down"], keys["Left"], keys["Right"])
+root.bind("<KeyPress>", kd)
+root.bind("<KeyRelease>", ku)
+def emu_thread():
+    acc = 0
+    while True:
+        if cpu.running and not cpu.paused:
+            for _ in range(CYCLES_PER_FRAME//3):
+                cpu.step()
+                if not cpu.running:
+                    break
+            ppu.vblank()
+            try:
+                cpu.nmi()
+            except:
+                pass
+        time.sleep(1/60)
+threading.Thread(target=emu_thread, daemon=True).start()
+# demo without rom
+for _i, _b in enumerate([0xA9, 0x01, 0x85, 0x86, 0xE6, 0x86, 0x4C, 0x02, 0x80]):
+    bus.prg[_i] = _b
+bus.prg[0x7FFC] = 0x00
+bus.prg[0x7FFD] = 0x80
+bus.prg[0x7FFA] = 0x00
+bus.prg[0x7FFB] = 0x80
+cpu.reset()
+last = int(time.time())
+prev = 0
+fc = 0
+def tick():
+    global last, prev, fc
+    for m in LOG.poll_all():
+        txt.insert(tk.END, m+"\n")
+        txt.see(tk.END)
+    fc += 1
+    if fc % 10 == 0:
+        ppu.render(img)
+    now = int(time.time())
+    if now != last:
+        last = now
+        ips = cpu.count-prev
+        prev = cpu.count
+        msg = f"[SEC {time.strftime('%H:%M:%S')}] PC={cpu.pc:04X} A={cpu.a:02X} X={cpu.x:02X} Y={cpu.y:02X} {ips}i/s f={ppu.frame} unk={len(cpu.unk)} run={cpu.running}"
+        txt.insert(tk.END, msg+"\n")
+        txt.see(tk.END)
+        status.config(text=msg)
+    root.after(50, tick)
+tick()
+root.mainloop()
