@@ -1,0 +1,20 @@
+NES EMULATOR — INPUT / FRAME PACING FIX — 2026-10-09
+
+WHAT CHANGED
+- Added a validated NROM self-JMP batching path. It recognizes only an actual absolute JMP whose destination is that same opcode address, batches its 3-cycle waits to the existing CPU/PPU sync boundary, and is disabled around VBlank. It preserves guest CPU cycles and frame state.
+- Fixed Mapper-0 PPUSTATUS polling for all four conditional branch polarities (BPL, BMI, BVC, BVS). The previous accelerated path only covered BPL/BVC; the new regression test compares the optimized path against the ordinary CPU interpreter.
+- Stopped invalidating sprite line/pixel caches on unrelated PPUCTRL writes (NMI-enable / nametable bits) and PPUMASK visibility changes. Sprite caches invalidate only when PPUCTRL sprite table/size bits (3 or 5) change, or on OAM/CHR changes.
+- GUI slices use zero-delay timer callbacks rather than re-adding an idle callback from within an idle callback, so Tk can service visible frame updates and input between incomplete frame slices.
+- Default instruction slice is now 6000 instructions to bound UI event latency; the cache and polling optimizations reduce wasted work instead of merely increasing the slice.
+
+MEASUREMENTS IN THIS ENVIRONMENT (Python 3.13, generated test ROMs)
+- NROM self-JMP core benchmark, 120 frames: optimized 431.8 core FPS; standard instruction path 65.1 core FPS; exact CPU/PPU/frame state matched for 12 consecutive frames before timing.
+- Tk GUI benchmark: diagnostic test ROM 60.0 drawn FPS; PPU polling stress ROM 60.0 drawn FPS.
+- All 14 regression / equivalence scripts in CHECK.bat passed on this environment.
+- These are results for generated test ROMs. The real Super Mario Bros ROM was not present and was NOT directly play-tested; performance on a specific commercial ROM and Windows PC is not guaranteed by these numbers.
+
+RUN / DIAGNOSE
+- Extract this ZIP to a new folder and run run.bat, then Ctrl+O to open a .nes file.
+- The displayed FPS in the app is rendered-frame FPS (not CPU-core benchmark speed).
+- Run CHECK.bat to execute all included checks.
+- tests/diagnostic.nes and tests/ppu_poll_stress.nes are generated diagnostics, not commercial game ROMs.

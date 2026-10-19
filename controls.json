@@ -1,0 +1,22 @@
+{
+  "P1": {
+    "A": "a",
+    "B": "s",
+    "SELECT": "shift_r",
+    "START": "return",
+    "UP": "up",
+    "DOWN": "down",
+    "LEFT": "left",
+    "RIGHT": "right"
+  },
+  "P2": {
+    "A": "c",
+    "B": "v",
+    "SELECT": "b",
+    "START": "n",
+    "UP": "w",
+    "DOWN": "s",
+    "LEFT": "a",
+    "RIGHT": "d"
+  }
+}
